@@ -26,9 +26,12 @@ public final class IndexReader {
 
     public static InvertedIndex load(Path dir) throws IOException {
         // docs.bin
+        // docs.bin
+        String analyzerName;
         List<String> docIds = new ArrayList<>();
         int[] docLengths;
         try (DataInputStream in = bodyStream(openVerified(dir.resolve(IndexFormat.DOCS_FILE)))) {
+            analyzerName = in.readUTF();
             int numDocs = in.readInt();
             docLengths = new int[numDocs];
             for (int i = 0; i < numDocs; i++) {
@@ -50,7 +53,8 @@ public final class IndexReader {
             }
         }
 
-        // postings.bin: jump to each term's offset and decode its gaps back to doc indexes
+        // postings.bin: jump to each term's offset and decode its gaps back to doc
+        // indexes
         ByteBuffer postingsBuf = openVerified(dir.resolve(IndexFormat.POSTINGS_FILE));
         Map<String, List<Posting>> postings = new HashMap<>();
         for (int i = 0; i < terms.size(); i++) {
@@ -65,10 +69,13 @@ public final class IndexReader {
             }
             postings.put(terms.get(i), list);
         }
-        return new InvertedIndex(docIds, docLengths, postings);
+        return new InvertedIndex(analyzerName, docIds, docLengths, postings);
     }
 
-    /** Reads the file, checks it, returns a buffer positioned at the body start, limited to the body end. */
+    /**
+     * Reads the file, checks it, returns a buffer positioned at the body start,
+     * limited to the body end.
+     */
     private static ByteBuffer openVerified(Path path) throws IOException {
         byte[] bytes = Files.readAllBytes(path);
         if (bytes.length < HEADER_BYTES + FOOTER_BYTES) {

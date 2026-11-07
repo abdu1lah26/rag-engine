@@ -40,6 +40,7 @@ public final class IndexWriter {
 
     private static void writeDocs(InvertedIndex index, Path path) throws IOException {
         writeFile(path, out -> {
+            out.writeUTF(index.analyzerName());
             out.writeInt(index.numDocs());
             for (int i = 0; i < index.numDocs(); i++) {
                 out.writeUTF(index.docId(i));
