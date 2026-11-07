@@ -1,5 +1,7 @@
 package io.github.abdullah.rag.index;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import io.github.abdullah.rag.bm25.Tokenizer;
 import io.github.abdullah.rag.model.Document;
 import io.github.abdullah.rag.retrieval.Retriever;
@@ -85,6 +87,19 @@ public final class IndexedBm25Retriever implements Retriever {
         List<ScoredDoc> results = new ArrayList<>(heap);
         results.sort(Comparator.comparingDouble(ScoredDoc::score).reversed());
         return results;
+    }
+
+    /** Persist the built index to a directory (see IndexFormat). */
+    public void save(Path dir) throws IOException {
+        if (index == null) {
+            throw new IllegalStateException("nothing to save: call index() first");
+        }
+        IndexWriter.write(index, dir);
+    }
+
+    /** Load a retriever from a directory written by save(). No re-tokenizing. */
+    public static IndexedBm25Retriever load(Path dir) throws IOException {
+        return new IndexedBm25Retriever(IndexReader.load(dir));
     }
 
     private static double idf(int df, int n) {
