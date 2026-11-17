@@ -84,3 +84,73 @@ Decision log for the RAG engine. Each entry: decision, alternatives rejected, er
     java -cp $cp io.github.abdullah.rag.eval.RunLuceneCompare
     java -cp $cp io.github.abdullah.rag.eval.RunAnalyzers
     java -cp $cp io.github.abdullah.rag.eval.RunIndexSize
+
+## Milestone 3: Chunking strategies
+
+### Setup
+- SciFact abstracts are short (~215 words on average), so chunking barely matters on the original corpus. Built long documents instead: shuffle with seed 42, pack 10 abstracts per long doc (5183 abstracts -> 519 long docs), record each abstract's char span.
+- Scoring is at original-abstract level: a retrieved chunk credits every abstract whose span it overlaps, results deduplicated in rank order, then nDCG/Recall/MRR@10 against the original SciFact qrels. A chunk straddling two abstracts therefore costs ranking quality.
+- Oracle chunker (cuts exactly at abstract boundaries) scores 0.6827 on test, identical to the M2 whole-abstract score. This validated the span mapping and the scoring bridge, and gives every chunker a ceiling.
+- Two packing modes: hard (abstracts joined with a space, no structure) and paragraph (joined with a blank line).
+- Tuned on the train split (809 queries), frozen, evaluated once on test (300 queries). Corpus and long-doc layout are the same in both splits; only queries are held out.
+- Selection rule, fixed before the test run: per family and mode, highest train nDCG@10 subject to intact rate >= 0.5. The 0.5 threshold is a judgment call.
+
+### Chunkers implemented
+- Fixed-size: sliding window of N words with overlap.
+- Recursive: paragraph, then line, then sentence, then word boundaries, packed greedily to N words.
+- Semantic: TextTiling style. Embed each sentence, compare k sentences before vs after each gap, cut at local similarity minima below mean - alpha*std, with min and max word limits. Uses a hashed term-frequency embedder (lexical, no model) behind an `Embedder` interface, so the ONNX embedder can be swapped in at M4/M5.
+
+### Decisions and alternatives rejected
+- Hashed-TF embedder now, neural later: rejected pulling ONNX and a WordPiece tokenizer into a chunking milestone.
+- Document-level scoring (any chunk of the right long doc counts): rejected, too lenient, every chunker would score the same.
+- Choosing configs by nDCG alone: rejected after the sweep, because fixed-50 and recursive-50 had top nDCG with intact rate 0.000.
+- Tuning on test: rejected, used train for tuning.
+- Overlap: did not help in the sweep (o0 matched or beat o20 for recursive); not used in the selected configs except the fixed/recursive-50 rows, which only appear as failing-constraint references.
+
+### Final results (test, 300 queries, K=10)
+Hard mode (no structure):
+
+| chunker | chunks | nDCG@10 | R@10 | MRR@10 | avg words | purity | boundary | intact |
+|---|---|---|---|---|---|---|---|---|
+| fixed-50-o10 (fails intact) | 27928 | 0.5916 | 0.7572 | 0.5452 | 49.6 | 0.796 | 0.000 | 0.000 |
+| recursive-50-o10 (fails intact) | 29961 | 0.6130 | 0.7506 | 0.5763 | 38.4 | 0.891 | 0.305 | 0.000 |
+| semantic k3 min100 max300 a0.0 | 6633 | 0.6085 | 0.7843 | 0.5595 | 167.7 | 0.804 | 0.716 | 0.557 |
+| oracle | 5183 | 0.6827 | 0.8168 | 0.6455 | 214.6 | 1.000 | 1.000 | 1.000 |
+
+Paragraph mode:
+
+| chunker | chunks | nDCG@10 | R@10 | MRR@10 | avg words | purity | boundary | intact |
+|---|---|---|---|---|---|---|---|---|
+| fixed-50-o10 (fails intact) | 27928 | 0.5916 | 0.7572 | 0.5452 | 49.6 | 0.796 | 0.000 | 0.000 |
+| recursive-300-o0 | 4951 | 0.6297 | 0.7977 | 0.5801 | 224.7 | 0.804 | 0.782 | 0.884 |
+| semantic k3 min100 max300 a0.0 | 6635 | 0.6095 | 0.7832 | 0.5613 | 167.7 | 0.809 | 0.724 | 0.561 |
+| oracle | 5183 | 0.6827 | 0.8168 | 0.6455 | 214.6 | 1.000 | 1.000 | 1.000 |
+
+### Significance (paired bootstrap, 10k resamples, per-query nDCG)
+- Every chunker loses to the oracle by 0.05 to 0.07 nDCG@10, and every such interval excludes 0.
+- On nDCG, chunkers are not separable in hard mode (all intervals include 0). In paragraph mode only recursive-300 over fixed-50 is significant (+0.038, CI +0.011 to +0.064).
+- Semantic vs recursive-300 in paragraph mode: -0.020, CI -0.042 to +0.001, not significant.
+- Semantic Recall@10 lead over recursive-50 in hard mode (+0.034, p=0.017) is suggestive only: 12 comparisons were run, so it does not survive correction.
+- Train-to-test shrinkage: semantic hard mode 0.6438 -> 0.6085; recursive-50 0.6212 -> 0.6130. Part of semantic's train lead was fit to the train queries.
+
+### Title ablation (test, nDCG@10, locked configs)
+Re-attaching an abstract's title to chunks that start mid-abstract: fixed-50 +0.058 and recursive-50 +0.054 (CIs exclude 0), recursive-300 +0.010, semantic +0.007 (hard, no detectable difference) and +0.009 (paragraph, borderline). Oracle +0.0000, as expected. Caveat: the title is attached using the known abstract spans, so this is an upper bound for "metadata on every chunk"; a real pipeline has one title per document.
+
+### Conclusions I can defend
+1. nDCG on 300 queries cannot rank the chunkers; intact rate and boundary integrity can. nDCG alone would have picked the 50-word configs, which cut every abstract.
+2. With structure present, recursive-300 is the best tradeoff (intact 0.884, nDCG not worse than semantic) at the lowest complexity.
+3. Without structure, semantic is the only chunker that keeps over half of the abstracts intact, at no detectable nDCG cost.
+4. No chunker closes the gap to the oracle.
+5. Small chunks need the document title re-attached; larger chunks barely do.
+
+### Limitations
+- Long docs are random concatenations, so topic shifts are sharper than in real text. This flatters semantic chunking.
+- Hashed-TF is lexical; a neural embedder may change semantic's results (re-run at M4/M5).
+- Words, not model tokens, are the size unit.
+- A single sentence longer than max words stays one oversized chunk in the semantic chunker.
+- No answer-span dataset, so "intact" is a proxy for "answer not cut in half".
+
+### Errors hit
+- Guessed the analyzer interface name (`Analyzer`); the real one is `TextAnalyzer`, and it is not a functional interface, so tests use `SimpleAnalyzer`.
+- `-Dexec.mainClass` was ignored because the pom hardcodes the main class; runners are launched with `java -cp target\classes;<cp.txt>` instead.
+- The first semantic grid capped max words at 200, below the abstract length, which understated its intact rate; widened to 300.
