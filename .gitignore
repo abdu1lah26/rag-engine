@@ -24,3 +24,7 @@ indexes/
 # Logs
 *.log
 cp.txt
+
+models/
+
+models/
