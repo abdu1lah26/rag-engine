@@ -1,4 +1,4 @@
-# DESIGN.md
+﻿# DESIGN.md
 
 Decision log for the RAG engine. Each entry: decision, alternatives rejected, errors hit, numbers.
 
@@ -154,3 +154,125 @@ Re-attaching an abstract's title to chunks that start mid-abstract: fixed-50 +0.
 - Guessed the analyzer interface name (`Analyzer`); the real one is `TextAnalyzer`, and it is not a functional interface, so tests use `SimpleAnalyzer`.
 - `-Dexec.mainClass` was ignored because the pom hardcodes the main class; runners are launched with `java -cp target\classes;<cp.txt>` instead.
 - The first semantic grid capped max words at 200, below the abstract length, which understated its intact rate; widened to 300.
+## Milestone 4: HNSW vector index + real embeddings
+
+### Setup
+- Data: SciFact test, 5183 docs, 300 judged queries, K=10. Vectors are all-MiniLM-L6-v2 (384-d), documents embedded as title + abstract.
+- Embedding: one-off job, 211.2 s for the corpus (40.7 ms/doc), cached to disk. Every benchmark loads the cache.
+- Query vectors are precomputed, so reported latency is index search time only. Live query embedding cost was NOT measured separately; add it before quoting an end-to-end latency.
+- All indexes are single-threaded scalar Java (no SIMD), JVM warmed up with one pass before timing. Hardware: 12th Gen Intel(R) Core(TM) i5-12450H, 16 GB RAM, Windows 11, Java 21 (Temurin).
+
+### Components implemented
+- VectorMath (dot, distance = 1 - dot, normalize), VectorIndex interface, BruteForceIndex (exact, heap top-k), HnswIndex (own implementation), HnswConfig.
+- WordPieceTokenizer (BERT uncased, hand-written), OnnxEmbedder (tokenizer + ONNX Runtime + mean pooling + L2 normalise), EmbeddingCache (binary file with model name and dimension in the header), DenseRetriever (any VectorIndex behind the Retriever interface).
+
+### Decisions and alternatives rejected
+- Embedding model: all-MiniLM-L6-v2 via ONNX. Rejected bge-small-en: it needs query prefixes and CLS pooling, which are extra variables while validating HNSW (can be added later as a measured comparison). Rejected an API model: costs money and is not reproducible offline.
+- Tokenizer: wrote WordPiece by hand (about 150 lines) instead of adding a tokenizer library. Validated against known BERT token IDs (hello=7592, world=2088) and against reference similarities for the model: 0.6660 vs 0.666 and 0.1046 vs 0.105 (reference values recalled from the sentence-transformers docs, not re-fetched).
+- Similarity: all vectors are unit length, so cosine = dot product, and distance = 1 - dot. One function is used by every index, so recall comparisons use the same metric.
+- Ground truth: BruteForceIndex, tested against a full sort on random data. All ANN recall numbers are measured against it.
+- HNSW internals: nodes addressed by int slot, not string id; graph is directed (pruning can leave one-way edges); level drawn from a seeded geometric distribution (test: P(level>=1) about 1/M, P(level>=2) about 1/M^2); neighbour selection uses the paper's diversity heuristic with keepPrunedConnections, and over-full neighbour lists are re-pruned with the same heuristic.
+- efSearch is a query-time setter, not part of HnswConfig, so one built graph can be swept over many efSearch values.
+- Cache header stores model name and dimension; loadFor() rejects a mismatch. This is the defence for "embedding model changes, old vectors become invalid".
+- Documents truncated at 256 tokens (MiniLM training length). Some long abstracts are cut; not quantified.
+
+### Benchmark numbers (SciFact test, 300 queries, k=10)
+
+Dense baseline, exact search (BruteForceIndex over cached MiniLM vectors):
+
+| retriever | Recall@10 | MRR@10 | nDCG@10 | p50 ms | p95 ms |
+|---|---|---|---|---|---|
+| bm25-naive (M1) | 0.7876 | 0.6309 | 0.6634 | 4.640 | 8.066 |
+| dense-brute-force | 0.7883 | 0.6068 | 0.6484 | 1.199 | 1.645 |
+
+The dense nDCG@10 of 0.6484 is in line with the published MiniLM-L6 SciFact figure of roughly 0.645 (recalled from memory, not re-checked), which validates tokenizer, ONNX call, pooling, cache and retriever end to end. Naive BM25 beats exact dense here, which is expected on a dataset full of exact scientific terms and is the motivation for hybrid retrieval in M5.
+
+efSearch sweep (M=16, efC=200, seed 42; ANN recall is measured against BruteForceIndex top-10; saved in results/hnsw-sweep.csv):
+
+| index | ANN recall@10 | nDCG@10 | p50 ms | p95 ms |
+|---|---|---|---|---|
+| brute-force | 1.0000 | 0.6484 | 1.322 | 2.341 |
+| hnsw ef=10 | 0.9240 | 0.6217 | 0.113 | 0.159 |
+| hnsw ef=20 | 0.9667 | 0.6422 | 0.162 | 0.230 |
+| hnsw ef=40 | 0.9877 | 0.6484 | 0.270 | 0.410 |
+| hnsw ef=80 | 0.9980 | 0.6484 | 0.464 | 0.630 |
+| hnsw ef=160 | 0.9987 | 0.6484 | 0.772 | 1.025 |
+| hnsw ef=320 | 1.0000 | 0.6484 | 1.509 | 2.613 |
+| hnsw ef=640 | 1.0000 | 0.6484 | 2.129 | 3.510 |
+
+Build time: 6.2 s for 5183 vectors (brute force: 2 ms). Plot: results/hnsw-recall-vs-latency.svg.
+
+Run-to-run timing noise: an earlier identical run gave identical recall and nDCG (the build is seeded) but different latencies, e.g. hnsw ef=40 p50 0.350 ms and brute force 1.279 ms. So the ef=40 speedup over brute force is 3.7x in one run and 4.9x in the other; quote it as "about 4x".
+
+Build-parameter sweep (single run, seed 42; recall = ANN recall@10 at efSearch 20 / 40 / 80; p50 is at efSearch 40):
+
+| M | efC | build s | recall @20 | recall @40 | recall @80 | p50 ms @40 |
+|---|---|---|---|---|---|---|
+| 8 | 100 | 2.5 | 0.9147 | 0.9603 | 0.9883 | 0.189 |
+| 8 | 200 | 3.4 | 0.9187 | 0.9627 | 0.9893 | 0.170 |
+| 8 | 400 | 5.3 | 0.9183 | 0.9620 | 0.9880 | 0.180 |
+| 16 | 100 | 4.5 | 0.9653 | 0.9853 | 0.9970 | 0.260 |
+| 16 | 200 | 5.8 | 0.9667 | 0.9877 | 0.9980 | 0.280 |
+| 16 | 400 | 8.8 | 0.9657 | 0.9873 | 0.9973 | 0.269 |
+| 32 | 100 | 9.8 | 0.9857 | 0.9940 | 0.9980 | 0.404 |
+| 32 | 200 | 25.9 (outlier) | 0.9873 | 0.9937 | 0.9987 | 0.438 |
+| 32 | 400 | 15.3 | 0.9870 | 0.9943 | 0.9987 | 0.408 |
+
+The 25.9 s build (M=32, efC=200) is system noise: efC=400 built faster (15.3 s), which is impossible for a real cost. It is not quoted anywhere as a result.
+
+Diversity heuristic ablation (efC=100, mean over seeds 1, 2, 3; "nearest-M" = link to the M nearest candidates, no diversity check):
+
+| selection | M | build s | recall @20 | recall @40 | recall @80 | p50 ms @20 / @40 / @80 |
+|---|---|---|---|---|---|---|
+| heuristic | 8 | 2.4 | 0.9153 | 0.9607 | 0.9879 | 0.099 / 0.162 / 0.311 |
+| nearest-M | 8 | 1.6 | 0.8468 | 0.9089 | 0.9568 | 0.089 / 0.150 / 0.249 |
+| heuristic | 16 | 4.1 | 0.9664 | 0.9858 | 0.9971 | 0.162 / 0.253 / 0.428 |
+| nearest-M | 16 | 2.4 | 0.9333 | 0.9723 | 0.9912 | 0.138 / 0.222 / 0.386 |
+
+### Conclusions I can defend
+1. HNSW matches exact search on task quality at a fraction of the latency. At efSearch=40: ANN recall@10 0.9877, nDCG@10 identical to brute force (0.6484), p50 about 4x lower (3.7x and 4.9x in two runs). At efSearch=10: about 12x lower p50 for -0.027 nDCG.
+2. Past efSearch=80 the extra latency buys almost nothing (recall 0.9980 -> 1.0000). At efSearch>=320, HNSW is no faster than brute force on this corpus.
+3. ANN recall and task quality are different measurements. nDCG@10 is flat at 0.6484 from efSearch=40 even though ANN recall is still 0.9877 there: the missed neighbours are low-ranked ones that do not change which judged documents reach the top 10.
+4. efConstruction above 100 gave no measurable recall gain at this corpus size (differences at most about 0.004, within noise) while build time grew (M=16: 4.5 s, 5.8 s, 8.8 s for efC 100, 200, 400). The default efC=200 was chosen before measuring and is not supported by this data; efC=100 is enough here.
+5. M trades build time for query-time beam width. At matched recall (about 0.986) M=8/efSearch=80, M=16/efSearch=40 and M=32/efSearch=20 land at about 0.25 to 0.30 ms p50, but build time goes 2.5 s, 4.5 s, 9.8 s. M=16 is a reasonable middle, not a clear winner. Memory was not measured.
+6. The diversity heuristic beats plain nearest-M neighbour selection: +3.1 to +6.9 recall points at M=8, +0.6 to +3.3 at M=16 (gap shrinks as M or efSearch grows). Cost: build is 1.5x to 1.7x slower, query latency at equal efSearch about 8 to 10% higher (differences of 0.01 to 0.04 ms, close to noise). At matched recall it is roughly 1.5x faster (heuristic M=16/efSearch=40: 0.9858 at 0.253 ms vs nearest-M M=16/efSearch=80: 0.9912 at 0.386 ms), and it lets a smaller M reach a given recall.
+7. On SciFact, exact dense (nDCG@10 0.6484) is below naive BM25 (0.6634). The two should fail on different queries, which is the case for hybrid fusion in M5.
+
+### Limitations
+- Only 5183 vectors. Brute force is already about 1.3 ms there, so the speedups here may not extrapolate to millions of vectors, and the memory-vs-speed tradeoff only shows up at scale.
+- Brute force is a plain scalar Java loop with no SIMD or multithreading, so every speedup is relative to a naive baseline, not an optimised one.
+- Latencies are single runs of 300 queries; differences below about 0.1 ms are within noise. The build-parameter sweep uses one seed; only the ablation averages 3 seeds.
+- The 0.98 recall target was picked after seeing the sweep, not fixed in advance.
+- Query embedding time is excluded (query vectors are precomputed). End-to-end latency would add the ONNX inference cost.
+- The HNSW graph is in memory only and rebuilt from the cached vectors on each run (about 6 s). No persistence, deletes or updates yet (M6); insertion is not thread-safe.
+- One dataset (SciFact), one model (MiniLM-L6), no comparison yet against Lucene HNSW or pgvector.
+- Documents are truncated at 256 tokens; how many abstracts that affects was not measured.
+
+### Errors hit
+- Ran mvn exec:java with -Dexec.mainClass again; the pom hardcodes the main class, so it silently ran RunBaseline instead of RunEmbedCorpus. Fixed by launching runners with java -cp target\classes;<cp.txt> (same trap as M3).
+- Wrote a leftover empty loop in RunHnswSweep (harmless, removed).
+- Predicted HNSW would not be meaningfully faster than brute force at 5k vectors; measured 3.7x to 4.9x at efSearch=40. The prediction was wrong.
+- The build sweep produced a 25.9 s build for M=32/efC=200 while efC=400 took 15.3 s, which is impossible as a real cost. Treated as system noise and excluded from conclusions.
+- Latency comparisons between two identical runs differed by up to 30% (brute force 1.279 vs 1.322 ms, hnsw ef=40 0.350 vs 0.270 ms). Quote ranges, not single figures.
+
+### Reproduce
+One-off setup: model files (gitignored) and classpath.
+
+    New-Item -ItemType Directory -Force models\all-MiniLM-L6-v2
+    $base = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main"
+    Invoke-WebRequest "$base/onnx/model.onnx" -OutFile models\all-MiniLM-L6-v2\model.onnx
+    Invoke-WebRequest "$base/vocab.txt" -OutFile models\all-MiniLM-L6-v2\vocab.txt
+    mvn -q compile
+    mvn -q dependency:build-classpath "-Dmdep.outputFile=cp.txt"
+    $cp = "target\classes;" + (Get-Content cp.txt)
+
+Embed once (about 211 s), then run the benchmarks.
+
+    java -cp $cp io.github.abdullah.rag.eval.RunEmbedCorpus
+    java -cp $cp io.github.abdullah.rag.eval.RunDenseBaseline
+    java -cp $cp io.github.abdullah.rag.eval.RunHnswSweep
+    java -cp $cp io.github.abdullah.rag.eval.PlotRecallLatency
+    java -cp $cp io.github.abdullah.rag.eval.RunHnswBuildSweep
+    java -cp $cp io.github.abdullah.rag.eval.RunHnswHeuristicAblation
+
+Only RunHnswSweep writes a CSV (results/hnsw-sweep.csv); the other two sweeps print to the console. Tests that need the model skip themselves if models/ is absent (as on CI).
