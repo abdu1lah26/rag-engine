@@ -52,6 +52,16 @@ public class HnswIndex implements VectorIndex {
 
     private int efSearch = 50; // query-time beam width, changeable without rebuilding
 
+    private boolean useHeuristic = true; // false = plain "M nearest" (for the ablation)
+
+    /** Must be called before the first add(). */
+    public void setUseHeuristic(boolean useHeuristic) {
+        if (!nodes.isEmpty()) {
+            throw new IllegalStateException("set before adding vectors");
+        }
+        this.useHeuristic = useHeuristic;
+    }
+
     public HnswIndex(int dimension, HnswConfig config) {
         if (dimension <= 0) {
             throw new IllegalArgumentException("dimension must be positive");
@@ -104,7 +114,7 @@ public class HnswIndex implements VectorIndex {
         return VectorMath.distance(query, nodes.get(slot).vector);
     }
 
-        /** Test hook: appends an unlinked node and returns its slot. */
+    /** Test hook: appends an unlinked node and returns its slot. */
     int addRawNode(String id, float[] vector, int level) {
         nodes.add(new Node(id, vector, level));
         int slot = nodes.size() - 1;
@@ -118,15 +128,26 @@ public class HnswIndex implements VectorIndex {
         nodes.get(b).neighbours[layer].add(a);
     }
 
-        /**
+    /**
      * Neighbour selection heuristic (Algorithm 4 in the paper, with
      * keepPrunedConnections). Picks up to maxCount slots from candidates,
      * preferring diverse directions over a tight cluster of near-duplicates.
      *
-     * @param candidates must be sorted nearest-first, dist = distance to the base node
+     * @param candidates must be sorted nearest-first, dist = distance to the base
+     *                   node
      * @return chosen slots, in the order they were selected
      */
     List<Integer> selectNeighbours(List<Candidate> candidates, int maxCount) {
+        if (!useHeuristic) {
+            List<Integer> nearest = new ArrayList<>();
+            for (Candidate c : candidates) {
+                if (nearest.size() >= maxCount) {
+                    break;
+                }
+                nearest.add(c.slot());
+            }
+            return nearest;
+        }
         List<Integer> selected = new ArrayList<>();
         List<Candidate> discarded = new ArrayList<>();
 
@@ -203,7 +224,7 @@ public class HnswIndex implements VectorIndex {
         return out;
     }
 
-        @Override
+    @Override
     public void add(String id, float[] vector) {
         if (vector.length != dimension) {
             throw new IllegalArgumentException(
@@ -230,8 +251,7 @@ public class HnswIndex implements VectorIndex {
 
         // Phase 2: connect on every layer from min(level, maxLevel) down to 0.
         for (int layer = Math.min(level, maxLevel); layer >= 0; layer--) {
-            List<Candidate> found =
-                    searchLayer(vector, current, config.efConstruction(), layer);
+            List<Candidate> found = searchLayer(vector, current, config.efConstruction(), layer);
             List<Integer> chosen = selectNeighbours(found, config.m());
             int maxConn = (layer == 0) ? config.maxNeighboursLayer0() : config.m();
 
@@ -251,7 +271,9 @@ public class HnswIndex implements VectorIndex {
         }
     }
 
-    /** Re-prunes an over-full neighbour list back to maxConn using the heuristic. */
+    /**
+     * Re-prunes an over-full neighbour list back to maxConn using the heuristic.
+     */
     private void shrinkConnections(int slot, int layer, int maxConn) {
         Node node = nodes.get(slot);
         List<Candidate> cands = new ArrayList<>();
@@ -265,7 +287,7 @@ public class HnswIndex implements VectorIndex {
         node.neighbours[layer].addAll(kept);
     }
 
-        @Override
+    @Override
     public List<ScoredDoc> search(float[] query, int k) {
         if (query.length != dimension) {
             throw new IllegalArgumentException(
