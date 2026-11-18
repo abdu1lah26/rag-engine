@@ -8,18 +8,23 @@ import io.github.abdullah.rag.vector.HnswConfig;
 import io.github.abdullah.rag.vector.HnswIndex;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.nio.file.Files;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Sweeps HNSW efSearch on real SciFact embeddings and prints the recall/latency curve. */
+/**
+ * Sweeps HNSW efSearch on real SciFact embeddings and prints the recall/latency
+ * curve.
+ */
 public final class RunHnswSweep {
 
     private static final String MODEL = "onnx-all-MiniLM-L6-v2";
     private static final int DIM = 384;
     private static final int K = 10;
-    private static final int[] EF_VALUES = {10, 20, 40, 80, 160, 320, 640};
+    private static final int[] EF_VALUES = { 10, 20, 40, 80, 160, 320, 640 };
+    private static final List<String> CSV = new ArrayList<>();
 
     private RunHnswSweep() {
     }
@@ -73,6 +78,12 @@ public final class RunHnswSweep {
             hnsw.setEfSearch(ef);
             printRow("hnsw ef=" + ef, queries, qVecs, truth, dataset, null, hnsw);
         }
+        
+        Path out = Path.of("results", "hnsw-sweep.csv");
+        Files.createDirectories(out.getParent());
+        CSV.add(0, "index,ann_recall_at_10,ndcg_at_10,p50_ms,p95_ms");
+        Files.write(out, CSV);
+        System.out.println("Wrote " + out);
     }
 
     private static void printRow(String label, List<Query> queries, List<float[]> qVecs,
@@ -102,9 +113,13 @@ public final class RunHnswSweep {
             ndcgSum += Metrics.ndcgAtK(ranked, dataset.qrels().forQuery(queries.get(i).id()), K);
         }
         int n = queries.size();
-        System.out.printf("%-12s %-12.4f %-10.4f %-10.3f %-10.3f%n", label,
-                recallSum / n, ndcgSum / n,
-                EvalRunner.percentile(lat, 50), EvalRunner.percentile(lat, 95));
+        double recall = recallSum / n;
+        double ndcg = ndcgSum / n;
+        double p50 = EvalRunner.percentile(lat, 50);
+        double p95 = EvalRunner.percentile(lat, 95);
+        System.out.printf("%-12s %-12.4f %-10.4f %-10.3f %-10.3f%n", label, recall, ndcg, p50, p95);
+        CSV.add(String.format(java.util.Locale.ROOT, "%s,%.4f,%.4f,%.3f,%.3f",
+                label, recall, ndcg, p50, p95));
     }
 
     private static List<ScoredDoc> search(BruteForceIndex exact, HnswIndex hnsw, float[] v) {
