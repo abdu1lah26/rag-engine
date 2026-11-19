@@ -18,7 +18,8 @@ import java.util.Locale;
 
 /**
  * BM25 (stop+stem) vs dense HNSW vs hybrid RRF on SciFact test, with paired
- * bootstrap on per-query nDCG@10. Parameters are fixed before the run (RRF c=60,
+ * bootstrap on per-query nDCG@10. Parameters are fixed before the run (RRF
+ * c=60,
  * candidate depth 100, efSearch 40): no tuning on test.
  */
 public final class RunHybrid {
@@ -46,20 +47,29 @@ public final class RunHybrid {
         Retriever dense = new DenseRetriever(hnsw,
                 dataDir.resolve("embeddings-" + MODEL + "-docs.bin"), MODEL,
                 RunDenseBaseline.loadQueryVectors(dataDir, dataset));
-        // Children are indexed by EvalRunner below; the hybrid must not index them again.
+        // Children are indexed by EvalRunner below; the hybrid must not index them
+        // again.
         Retriever hybrid = new HybridRetriever(List.of(bm25, dense),
                 new RrfFusion(RRF_C), DEPTH, false);
+        // Config frozen from the train sweep (results/hybrid-train-sweep.csv).
+        Retriever tuned = new HybridRetriever(List.of(bm25, dense),
+                new RrfFusion(1), DEPTH, false);
 
         System.out.println(EvalRunner.run(bm25, dataset, K));
         System.out.println(EvalRunner.run(dense, dataset, K));
         System.out.println(EvalRunner.run(hybrid, dataset, K));
+        System.out.println(EvalRunner.run(tuned, dataset, K));
 
         double[] b = perQueryNdcg(bm25, dataset);
         double[] d = perQueryNdcg(dense, dataset);
         double[] h = perQueryNdcg(hybrid, dataset);
+        double[] t = perQueryNdcg(tuned, dataset);
         System.out.println("Paired bootstrap, nDCG@10 (" + RESAMPLES + " resamples):");
         printDiff("hybrid - bm25 ", PairedBootstrap.compare(h, b, RESAMPLES, SEED));
         printDiff("hybrid - dense", PairedBootstrap.compare(h, d, RESAMPLES, SEED));
+        printDiff("tuned  - bm25 ", PairedBootstrap.compare(t, b, RESAMPLES, SEED));
+        printDiff("tuned  - dense", PairedBootstrap.compare(t, d, RESAMPLES, SEED));
+        printDiff("tuned  - c=60 ", PairedBootstrap.compare(t, h, RESAMPLES, SEED));
     }
 
     private static double[] perQueryNdcg(Retriever r, BeirDataset ds) {
