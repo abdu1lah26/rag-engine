@@ -75,6 +75,51 @@ public final class WordPieceTokenizer {
         return new Encoding(input, attention, types);
     }
 
+    /**
+     * Cross-encoder input: [CLS] first [SEP] second [SEP]. Segment ids are 0 for
+     * [CLS], the first text and its [SEP], and 1 for the second text and the final
+     * [SEP]. If the pair is too long, the first text (the query) is capped at half
+     * the token budget and the second text (the document) is cut to what is left.
+     */
+    public Encoding encodePair(String first, String second) {
+        int budget = maxLength - 3; // [CLS] + 2 x [SEP]
+        List<Integer> a = pieces(first, budget / 2);
+        List<Integer> b = pieces(second, budget - a.size());
+
+        int total = a.size() + b.size() + 3;
+        long[] input = new long[total];
+        long[] types = new long[total];
+        int p = 0;
+        input[p++] = clsId;
+        for (int id : a) {
+            input[p++] = id;
+        }
+        input[p++] = sepId;
+        int secondStart = p;
+        for (int id : b) {
+            input[p++] = id;
+        }
+        input[p] = sepId;
+        for (int i = secondStart; i < total; i++) {
+            types[i] = 1L;
+        }
+        long[] attention = new long[total];
+        java.util.Arrays.fill(attention, 1L);
+        return new Encoding(input, attention, types);
+    }
+
+    /** WordPiece ids for a text, cut to at most limit pieces. */
+    private List<Integer> pieces(String text, int limit) {
+        List<Integer> ids = new ArrayList<>();
+        for (String word : basicTokenize(text)) {
+            wordPiece(word, ids);
+            if (ids.size() >= limit) {
+                break;
+            }
+        }
+        return ids.size() > limit ? new ArrayList<>(ids.subList(0, limit)) : ids;
+    }
+
     /** Clean, lowercase, strip accents, split on whitespace and punctuation. */
     List<String> basicTokenize(String text) {
         StringBuilder cleaned = new StringBuilder();

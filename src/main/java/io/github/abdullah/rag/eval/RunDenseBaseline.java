@@ -18,10 +18,16 @@ public final class RunDenseBaseline {
     }
 
     /** Loads cached query vectors and keys them by query text. */
-    static Map<String, float[]> loadQueryVectors(Path dataDir, BeirDataset dataset)
+        static Map<String, float[]> loadQueryVectors(Path dataDir, BeirDataset dataset)
             throws Exception {
+        return loadQueryVectors(dataDir, dataset, "embeddings-" + MODEL + "-queries.bin");
+    }
+
+    /** Same as above, but reads the named cache file (e.g. the train-split queries). */
+    static Map<String, float[]> loadQueryVectors(Path dataDir, BeirDataset dataset,
+            String cacheFileName) throws Exception {
         EmbeddingCache.Loaded loaded = EmbeddingCache.loadFor(
-                dataDir.resolve("embeddings-" + MODEL + "-queries.bin"), MODEL, DIM);
+                dataDir.resolve(cacheFileName), MODEL, DIM);
         Map<String, float[]> byId = new HashMap<>();
         for (int i = 0; i < loaded.ids().size(); i++) {
             byId.put(loaded.ids().get(i), loaded.vectors().get(i));
