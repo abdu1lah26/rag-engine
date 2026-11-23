@@ -154,6 +154,7 @@ Re-attaching an abstract's title to chunks that start mid-abstract: fixed-50 +0.
 - Guessed the analyzer interface name (`Analyzer`); the real one is `TextAnalyzer`, and it is not a functional interface, so tests use `SimpleAnalyzer`.
 - `-Dexec.mainClass` was ignored because the pom hardcodes the main class; runners are launched with `java -cp target\classes;<cp.txt>` instead.
 - The first semantic grid capped max words at 200, below the abstract length, which understated its intact rate; widened to 300.
+
 ## Milestone 4: HNSW vector index + real embeddings
 
 ### Setup
@@ -276,3 +277,91 @@ Embed once (about 211 s), then run the benchmarks.
     java -cp $cp io.github.abdullah.rag.eval.RunHnswHeuristicAblation
 
 Only RunHnswSweep writes a CSV (results/hnsw-sweep.csv); the other two sweeps print to the console. Tests that need the model skip themselves if models/ is absent (as on CI).
+
+## Milestone 5: Hybrid retrieval (RRF) + cross-encoder reranker
+
+### Setup
+- Data: SciFact, 5183 docs. Test = 300 queries, train = 809 queries. All tuning on train, config frozen, evaluated once on test.
+- Children: BM25 (own index, stop + stem analyzer) and dense HNSW (MiniLM-L6, M=16, efC=200, efSearch=40, cached vectors). Query vectors are precomputed, so latencies exclude query embedding.
+- Train-split query vectors embedded in a separate cache file (RunEmbedTrainQueries); the test cache is untouched, so M4 numbers stay reproducible.
+- Hardware as in M4. All latencies are single runs in one JVM.
+
+### Components implemented
+- RrfFusion (pure function over ranked lists), HybridRetriever (any Retriever list behind the Retriever interface), RerankingRetriever (first stage + PairScorer), OnnxCrossEncoder, WordPieceTokenizer.encodePair.
+- Experiment runners: RunHybrid, RunEmbedTrainQueries, RunHybridSweep, RunRerank, RunRerankCache, RunBlendSweep, RunBlendTest.
+
+### Decisions and alternatives rejected
+- **RRF on ranks only**, score = sum of 1/(c + rank). Rejected weighted score mixing: BM25 scores and cosine similarities are on different scales. A duplicate inside one list counts once; ties break by docId so runs are deterministic.
+- **Parameters fixed before the first run:** c=60, candidate depth 100, rerank depth 50. This makes the first hybrid number an untuned result.
+- **HybridRetriever has an indexChildren flag** so sweeps reuse one built HNSW graph (6 s to build) across configs.
+- **Train/test discipline:** sweeps on train, selection rules written down before seeing numbers, one test run per frozen config. Rejected tuning on test and re-running other depths or models on test.
+- **Reranker model:** cross-encoder/ms-marco-MiniLM-L-6-v2 via ONNX. It shares MiniLM's BERT uncased vocab (verified: vocab.txt files byte-identical), so the existing WordPiece tokenizer is reused. encodePair builds [CLS] query [SEP] doc [SEP] with segment ids 0/1; the query is capped at half the token budget. encode() was left untouched (a few duplicated lines) so the M4 reference-similarity check stays valid.
+- **Sanity check before SciFact:** relevant vs irrelevant pairs scored +8.8 vs -11.2 and +7.7 vs -11.2. The model card's Berlin example is about +8.6 (recalled from memory, not re-checked).
+- **Blend, not replace:** weighted RRF of the hybrid rank and the cross-encoder rank, (1-w)/(c+hybridRank) + w/(c+ceRank). Ranks, not logits, for the same scale reason. Cross-encoder scores cached to disk (results/rerank-scores-{train,test}.tsv) so the blend sweep is offline.
+
+### Selection rules (written before the runs)
+- Hybrid sweep: best train nDCG@10; within 0.002 of the best, lower depth; tie between configs at equal depth, higher train nDCG added before the test run.
+- Blend sweep: best train nDCG@10; within 0.002 of the best, smaller w.
+
+### Final results (SciFact test, 300 queries, k=10)
+| Retriever | Recall@10 | MRR@10 | nDCG@10 | p50 | p95 |
+|---|---|---|---|---|---|
+| bm25-indexed-stop-stem | 0.8168 | 0.6455 | 0.6827 | 0.17-0.27 ms | 0.30-0.69 ms |
+| dense-hnsw (efSearch 40) | 0.7883 | 0.6068 | 0.6484 | 0.29-0.43 ms | 0.36-0.69 ms |
+| hybrid RRF c=60, depth 100 | 0.8503 | 0.6816 | 0.7166 | 1.0-1.1 ms | 1.5-2.1 ms |
+| hybrid RRF c=1, depth 100 (train-tuned) | 0.8450 | 0.6771 | 0.7154 | 1.0 ms | 1.5 ms |
+| hybrid + cross-encoder, replace (depth 50) | 0.8156 | 0.6558 | 0.6884 | 4383 ms | 19129 ms |
+| hybrid + cross-encoder, frozen blend (c=1, w=0.6) | 0.8629 | 0.6860 | 0.7237 | n/m | n/m |
+
+Latency ranges are across the runs in this milestone. The rerank latency is a cold, unbatched, single-threaded pass. The frozen-blend latency was not measured (computed offline from cached scores).
+
+### Significance (paired bootstrap, 10k resamples, per-query nDCG@10)
+- hybrid c=60 minus BM25: +0.0339 (CI +0.0103 to +0.0578, p=0.005). Minus dense: +0.0682 (CI +0.0450 to +0.0917).
+- c=1 minus c=60 (both hybrid): -0.0012 (CI -0.0165 to +0.0141, p=0.86).
+- rerank (replace) minus hybrid: -0.0282 (CI -0.0577 to +0.0006, p=0.054). Minus BM25: +0.0057 (CI includes 0).
+- frozen blend minus hybrid: +0.0071 (CI -0.0135 to +0.0275, p=0.52). Minus BM25: +0.0409 (CI +0.0165 to +0.0654). Minus dense: +0.0753 (CI +0.0471 to +0.1043).
+- Recall@10 and MRR@10 differences were not bootstrapped; they are not claimed as gains.
+
+### Train sweeps (809 queries)
+- Train baselines: BM25 0.6946, dense 0.6578, hybrid c=60/depth 100 0.7121 nDCG@10.
+- Hybrid sweep (5 c values x 5 depths): every config beat both single retrievers (worst 0.7109). Smaller c was better (best c=1/depth 200, 0.7245), depth mattered little at c=1 (0.7191 to 0.7245). Frozen: c=1, depth 100 (0.7239). On test it was 0.7154 vs 0.7166 for the untuned default: the train gain did not transfer.
+- Blend sweep (3 c values x 11 weights): nDCG rose from w=0, peaked near w=0.6 and fell toward w=1 for all three c. Frozen: c=1, w=0.6, train 0.7352 (+0.023 over hybrid, CI +0.011 to +0.036). On test +0.007, not significant.
+
+### Conclusions I can defend
+1. Hybrid RRF beats BM25-only by +0.034 and dense-only by +0.068 nDCG@10 on SciFact test, with intervals excluding 0, using untuned defaults. This is the M5 result.
+2. The RRF constant and candidate depth do not matter on SciFact. The train-tuned c=1 gave -0.001 on test (null).
+3. Replacing the hybrid ordering with MS MARCO cross-encoder scores did not help: -0.028 nDCG (borderline, p=0.054) at about 4 s of model time per query. The right documents were present (hybrid Recall@50 = 0.9403), so the loss is in the ordering, not the candidate pool.
+4. Blending the cross-encoder in gave a small, statistically undetectable gain on test (+0.007, CI -0.014 to +0.028). It costs 50 model calls per query. Not adopted as the default pipeline.
+5. Train gains from tuning shrank on test in both tuning sweeps, the same pattern as the semantic chunker in M3. Selecting on test would have hidden this.
+
+### Limitations
+- One dataset (SciFact), one dense model, one reranker model; no second dataset (FiQA) yet.
+- Why the reranker underperforms is a hypothesis (trained on MS MARCO web QA, SciFact is claim verification); no domain-matched reranker was tried.
+- Rerank latency is single-threaded, unbatched, up to 512 tokens per pair. Batching, threads and shorter inputs would cut it a lot; not done because there was no quality gain to justify it. The test-cache run (~63 min) was about 3x slower per query than train (~49 min), likely laptop throttling.
+- Latencies are single runs; hybrid children run sequentially, not in parallel. Query embedding time is excluded.
+- Pure rerank scored slightly above hybrid on train (0.7180 vs 0.7121) but below on test (0.6884 vs 0.7166), so train is not a reliable predictor for the reranker here.
+- Blend sweep is 33 configs on one split; the best train number is optimistic by construction.
+
+### Errors hit
+- Predicted pure rerank would fall below hybrid on train; it scored slightly above (0.7180 vs 0.7121). It still lost on test.
+- Estimated the test-cache run at 18 minutes from the train rate; it took about 63.
+- Pasting several commands as one block merged lines, so Java received "train" as a main class (ClassNotFoundException). A fresh PowerShell session lost $cp, giving the same error for "test". Fix: rebuild cp.txt and $cp, check with $cp.Substring(0, 60), run one command at a time.
+
+### Reproduce
+    mvn -q compile
+    mvn -q dependency:build-classpath "-Dmdep.outputFile=cp.txt"
+    $cp = "target\classes;" + (Get-Content cp.txt -Raw).Trim()
+    New-Item -ItemType Directory -Force models\ms-marco-MiniLM-L-6-v2
+    $base = "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main"
+    Invoke-WebRequest "$base/onnx/model.onnx" -OutFile models\ms-marco-MiniLM-L-6-v2\model.onnx
+    Invoke-WebRequest "$base/vocab.txt" -OutFile models\ms-marco-MiniLM-L-6-v2\vocab.txt
+    java -cp $cp io.github.abdullah.rag.eval.RunEmbedTrainQueries
+    java -cp $cp io.github.abdullah.rag.eval.RunHybrid
+    java -cp $cp io.github.abdullah.rag.eval.RunHybridSweep
+    java -cp $cp io.github.abdullah.rag.eval.RunRerank
+    java -cp $cp io.github.abdullah.rag.eval.RunRerankCache train
+    java -cp $cp io.github.abdullah.rag.eval.RunBlendSweep
+    java -cp $cp io.github.abdullah.rag.eval.RunRerankCache test
+    java -cp $cp io.github.abdullah.rag.eval.RunBlendTest
+
+RunRerankCache takes about 50 to 65 minutes per split. Tests that need models skip themselves if models/ is absent.
