@@ -26,7 +26,7 @@ public final class RunBlendSweep {
     private static final long SEED = 42;
     private static final double TOLERANCE = 0.002;
 
-    private record Cand(String docId, int hybridRank, float ce) {
+    record Cand(String docId, int hybridRank, float ce) {
     }
 
     private record Config(int c, double w, double ndcg, double recall, double mrr) {
@@ -102,7 +102,7 @@ public final class RunBlendSweep {
     }
 
     /** Top-K doc ids after blending the two ranks. */
-    private static List<String> rank(List<Cand> cands, int c, double w) {
+    static List<String> rank(List<Cand> cands, int c, double w) {
         if (cands == null) {
             throw new IllegalStateException("query missing from the score cache");
         }
@@ -124,7 +124,7 @@ public final class RunBlendSweep {
         return ids;
     }
 
-    private static Map<String, List<Cand>> readScores(Path file) throws Exception {
+    static Map<String, List<Cand>> readScores(Path file) throws Exception {
         Map<String, List<Cand>> map = new LinkedHashMap<>();
         for (String line : Files.readAllLines(file, StandardCharsets.UTF_8)) {
             if (line.isEmpty()) {
