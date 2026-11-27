@@ -365,3 +365,96 @@ Latency ranges are across the runs in this milestone. The rerank latency is a co
     java -cp $cp io.github.abdullah.rag.eval.RunBlendTest
 
 RunRerankCache takes about 50 to 65 minutes per split. Tests that need models skip themselves if models/ is absent.
+
+## Milestone 6: WAL, crash recovery, updates, deletes
+
+### Setup
+- Data: SciFact test, 5183 docs, 300 queries, K=10. Pipeline and parameters as M5 (BM25 stop+stem, MiniLM HNSW M=16 efC=200 efSearch=40, RRF c=60, depth 100). Cached vectors, so latencies exclude query embedding. Hardware as M4. All latencies are single runs in one JVM.
+- Gate: the live engine must reproduce the M5 hybrid score (0.7166 nDCG@10) after ingest, compaction and restart.
+
+### Architecture
+- Immutable base (BM25 index + HNSW) + in-memory delta (docs added or updated since the base) + a set of "touched" docIds. A search reads one consistent snapshot of the delta and the touched set, runs base and delta, and drops every base hit whose docId is touched.
+- Directory layout: CURRENT (names generation N), base-N.snap (all docs with text and vectors), wal-N.log (changes since that base).
+- Write path: append to WAL, fsync, then apply to memory. Open path: read CURRENT, load base snapshot, scan WAL, truncate torn tail, replay into the same state machine the live path uses, delete files of other generations.
+- compact(): merge base + delta, write base-(N+1).snap (temp file, fsync, atomic rename), create wal-(N+1).log, switch CURRENT by atomic rename (the commit point), delete the old generation, rebuild indexes.
+
+### Decisions and alternatives rejected
+- **Never mutate the BM25 index or the HNSW graph.** Deletes and updates are tombstone + delta; compaction rebuilds. Rejected: in-place posting-list edits and HNSW node removal (graph connectivity repair is a research problem; rebuild is simple and testable).
+- **Update = one ADD record for an existing docId** (upsert). Rejected: separate DELETE + ADD records, because a crash between them would lose the doc. One record is atomic by construction.
+- **ADD records carry the embedding vector and the model name.** Replay never runs ONNX (about 40 ms/doc), and a vector from another model is rejected per record. Cost: about 3.1 KB per record (16,074,476 bytes for 5183 docs, mostly the 1,536-byte vector).
+- **Record format:** length | seq | type | payload | CRC32. Reader stops at the first truncated, corrupt or out-of-sequence record and truncates the file there, so new appends never follow garbage. Rejected: skipping a bad record and continuing (cannot know what was lost).
+- **Fsync on every append.** Rejected: group commit (more code, no measured need at 1.14 ms/put).
+- **BM25 across segments uses combined N, df and average length**, so base and delta scores are comparable (checked: a corpus split across base and delta scores identically to one index). Rejected: scoring segments separately and merging by raw score.
+- **Dense over-fetch:** ask the base for k + (number of touched ids), then filter. Rejected: filter after top-k (returns nothing when the nearest vectors are all deleted; tested).
+- **Delta dense search is brute force**, delta BM25 is a small InvertedIndex rebuilt whenever the state version changes.
+- **Snapshot and CURRENT are CRC-protected and atomically replaced.** A damaged base or CURRENT fails loudly instead of guessing. A WAL that does not start right after the base's last seq is rejected.
+- **Read-write lock in LiveEngine:** searches share a read lock, compaction takes the write lock. Without it a search could pair the new generation's empty touched set with the old base index and return deleted docs.
+
+### Benchmark numbers (SciFact test, 300 queries, K=10)
+| state | Recall@10 | MRR@10 | nDCG@10 | p50 ms | p95 ms |
+|---|---|---|---|---|---|
+| M5 hybrid (reference) | 0.8503 | 0.6816 | 0.7166 | 1.0-1.1 | 1.5-2.1 |
+| live, all 5183 docs in the delta | 0.8536 | 0.6817 | 0.7173 | 7.935 | 17.310 |
+| live, after compaction | 0.8503 | 0.6816 | 0.7166 | 1.165 | 2.447 |
+| live, after restart | 0.8503 | 0.6816 | 0.7166 | 0.997 | 1.862 |
+
+- Compacted and restarted engines reproduce M5 exactly. The delta-only engine is +0.0007 nDCG; not bootstrapped, not claimed as a gain (hypothesis: exact dense search in the delta vs approximate HNSW).
+- Ingest: 5183 puts in 5911 ms = 877 docs/s, 1.14 ms per put with fsync on every put (one run, one laptop disk; it may reflect a drive that acknowledges flush from a volatile cache).
+- Recovery: reopen with a full 5183-record WAL replay and empty base: 141 ms (the first query then builds the delta index). Reopen after compaction: 8138 ms, dominated by rebuilding HNSW (about 6 s in M4) and BM25 from the snapshot.
+- Compaction of 5183 docs: 8.6 s, searches blocked while it runs.
+
+Churn (518 docs deleted, 518 docs updated with identical content, no compaction; scored on 267 queries that still have a surviving relevant doc, with deleted docs removed from the judgments; not comparable with the 300-query numbers above). Two identical runs:
+
+| engine | nDCG@10 | deleted docs returned | p50 / p95 ms, run 1 | p50 / p95 ms, run 2 |
+|---|---|---|---|---|
+| live, churned, no compaction | 0.6947 | 0 | 5.246 / 9.453 | 11.493 / 14.672 |
+| reference, built from scratch on survivors | 0.6974 | 0 | 1.424 / 1.908 | 2.383 / 3.658 |
+| live, compacted | 0.6974 | 0 | 1.017 / 1.855 | 2.480 / 3.349 |
+
+- Churned vs reference: nDCG -0.0027 (not bootstrapped); top-10 differs on 115 of 300 queries (46 different doc set, 69 same docs in a different order). Compacted vs reference: top-10 identical on all 300 queries.
+- Compaction after churn: 7.4 s and 14.4 s in the two runs. Both runs used the same code, so the 2x spread in every timing is machine noise (likely throttling); quote ranges.
+
+### Tests
+- Crash by truncation: the log is cut at every byte offset (WalReaderTest, DurableStoreTest); recovery keeps exactly the complete records and later writes survive another restart.
+- Corruption: every single-bit flip in a record, snapshot and CURRENT is rejected; every proper prefix is rejected.
+- Compaction crash windows: debris before the CURRENT switch is ignored and cleaned; old files left after the switch are cleaned and the new generation is used.
+- Real kill: a child JVM writes in a loop, prints ACK only after the op returned, and is killed with destroyForcibly. Six rounds (45 to 154 acked ops): recovered = acked + 1 every time, never fewer, and the recovered state equals the operation history.
+- Concurrency: one writer (puts, deletes, updates), one compactor and two searchers; 7984 searches overlapped 20 compactions with no deleted doc returned and no duplicate ids; exact live set at the end, after a final compaction, and after restart.
+- Equivalence: an engine that went through updates, deletes and compaction returns the same ids and scores as one built from scratch on the same final docs.
+
+### Conclusions I can defend
+1. Crash recovery is exact: every acknowledged operation survives a process kill, and recovery from any torn tail stops at the last complete record.
+2. Deleted docs are never returned: 0 across the churn benchmark, the stress test, after compaction and after restart.
+3. Compaction is invisible to users except for speed: the compacted engine returns identical top-10 lists to a from-scratch build (0 of 300 differ).
+4. Un-compacted churn costs quality and latency, not correctness: -0.0027 nDCG and about 3.7x to 4.8x slower search at about 20% churn. The likely cause of the latency is dense over-fetch (about 1,100 candidates asked of HNSW); not directly measured.
+5. There is a real tradeoff between restart and search time: a log-only index restarts in 141 ms but searches in about 8 ms p50; a compacted index searches in about 1 ms but restarts in about 8 s because HNSW is rebuilt. Persisting the graph would remove the restart cost; not done.
+
+### Limitations
+- Crash tests kill the process or cut files. The OS page cache survives a process kill, so this does not prove fsync reaches stable storage; power-loss testing needs a VM or hardware. Torn tails come only from the byte-cut tests: in the six kill rounds truncatedBytes was 0 every time (a record is one small write).
+- The snapshot file is fsynced but its directory entry is not (Java on Windows cannot fsync a directory). On Linux the directory should be fsynced after each rename.
+- Compaction rebuilds BM25 and HNSW from scratch and blocks all searches for 7 to 14 s at 5183 docs. A background build followed by a swap would fix it; not done.
+- Base docs (text and vectors) stay on the heap next to the indexes built from them, a second copy of the corpus.
+- The 46 churned queries with a different doc set are not explained by measurement. Candidates: BM25 statistics skewed by hidden docs, a base graph that still contains deleted vectors, and the large over-fetch. No ablation was run.
+- The stress test uses an exact in-memory fake vector index, so it shows lock correctness, not compaction latency with real HNSW. A stress test can fail but cannot prove a lock-based design correct.
+- Updates in the churn benchmark re-put identical content, so they test the replace path but not changed-content ranking (that is covered by unit tests only).
+- One dataset (SciFact), one machine, single-run latencies, nothing measured beyond about 5k docs. Multi-process access is not handled: one process per directory.
+
+### Errors hit
+- Guessed package names twice (ScoredDoc and TextAnalyzer under the wrong packages; VectorIndex under hnsw instead of vector). Fixed by asking for the real package lines before writing more code.
+- Predicted the kill test would show torn tails; it showed none (0 truncated bytes in 6 rounds).
+- Predicted 3 to 15 ms per fsync'd put; measured 1.14 ms.
+- Predicted reopen after compaction at about 6 s; measured 8.1 s.
+- Predicted the churned top-10 would differ on single digits to low tens of queries; it differed on 115 (46 by doc set).
+- Churn and compaction timings doubled between two identical runs (machine noise).
+
+### Reproduce
+    mvn -q compile
+    mvn -q dependency:build-classpath "-Dmdep.outputFile=cp.txt"
+    $cp = "target\classes;" + (Get-Content cp.txt -Raw).Trim()
+    mvn -q test "-Dtest=WalRecordTest,WalWriterTest,WalReaderTest,WalPayloadsTest,LiveDocsTest,SnapshotFileTest,CurrentPointerTest,DurableStoreTest"
+    mvn -q test "-Dtest=SegmentedBm25Test,SegmentedDenseTest,SegmentedEngineTest,LiveEngineTest"
+    mvn -q test "-Dtest=CrashRecoveryTest,ConcurrencyStressTest"
+    java -cp $cp io.github.abdullah.rag.eval.RunLiveBench
+    java -cp $cp io.github.abdullah.rag.eval.RunChurnBench
+
+The benchmarks recreate results\live-bench and results\churn-live / churn-ref on each run. Tests that need the ONNX models skip themselves if models/ is absent.

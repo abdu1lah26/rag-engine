@@ -30,3 +30,7 @@ models/
 models/
 
 cp.txt
+
+results/live-bench/
+results/churn-live/
+results/churn-ref/
